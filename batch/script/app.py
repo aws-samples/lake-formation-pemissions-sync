@@ -7,10 +7,12 @@ import awswrangler as wr
 import tempfile
 import time
 import ast
+import io
 from collections import Counter
 from configparser import ConfigParser
 from urllib.parse import urlparse, urlunparse
 from awsglue.utils import getResolvedOptions
+from concurrent.futures import ThreadPoolExecutor
 
 information_schema_name = "information_schema"
 df_index = ['table_schema', 'table_name']
@@ -50,14 +52,17 @@ def get_database_name(row):
         return None
 
 def store_permission_data(permission_data,permissions_from_region,lf_storage_bucket,lf_storage_folder,lf_storage_file_name):
-    f = tempfile.TemporaryFile(mode='w+')
-    for pd in permission_data:
-        f.write(json.dumps(pd) + "\n")
-    rf = open(f.name,'r+b')
-    output_file_name = f"s3://{lf_storage_bucket}/{lf_storage_folder}/{permissions_from_region}/{lf_storage_file_name}"
-    print (f"Writing to output file name {output_file_name}")
-    wr.s3.upload(local_file=rf, path=output_file_name)
-    f.close()
+    with tempfile.NamedTemporaryFile(mode='w+', delete=False) as f:
+        for pd in permission_data:
+            f.write(json.dumps(pd) + "\n")
+        f.flush()  # Ensure all data is written to disk
+        output_file_name = f"s3://{lf_storage_bucket}/{lf_storage_folder}/{permissions_from_region}/{lf_storage_file_name}"
+        print(f"Writing to output file name {output_file_name}")
+    with open(file=f.name, mode='r+b') as rf:
+        print (f"Writing to output file name {output_file_name}")
+        wr.s3.upload(local_file=rf, path=output_file_name)
+        print (f"S3 file write is completed at  {output_file_name}")
+    
 
 def apply_table_permissions(file_location, destination_client, db_list,source_region,lf_storage_bucket,lf_storage_folder,lf_storage_file_name):
     print ("Reading permissions from s3 location")
@@ -162,6 +167,26 @@ def create_or_update_partition(glue_client, db_name, table_name, partition_data,
     except Exception as e:
         print(f"Failed to create partition {partition_data['Values']}. Reason: {e}")
         raise e
+def tpetask(object_data_line,update_table_s3_location,table_s3_mapping,glue_client,database_count,table_count,partition_count):
+    object_type, db_name, object_name, object_data = object_data_line.split("\t")
+    print(f"Processing object_type {object_type} {db_name} {object_name} ")
+    if object_type == 'database':
+        database_data = json.loads(object_data)
+        if update_table_s3_location:
+            database_data = update_database_location(database_data, table_s3_mapping)
+        create_database(glue_client, database_data)
+        database_count[db_name] += 1
+    elif object_type == 'table':
+        table_data = json.loads(object_data)
+        if update_table_s3_location:
+            table_data = update_table_location(table_data, table_s3_mapping)
+        create_table(glue_client, db_name, table_data)
+        table_count[db_name] += 1
+    elif object_type == 'partition':
+        partition_data = json.loads(object_data)
+        create_or_update_partition(glue_client, db_name, object_name, partition_data, update_table_s3_location, table_s3_mapping)
+        partition_count[db_name] += 1
+    #return database_count,table_count,partition_count
 
 def restore_data(config, data_source, glue_client, update_table_s3_location, table_s3_mapping):
     print("Restoring database...")
@@ -173,25 +198,18 @@ def restore_data(config, data_source, glue_client, update_table_s3_location, tab
     wr.s3.download(path=s3_path, local_file=f)
     f.seek(0)
     rf = open(f.name, "r+t")
-    for object_data_line in rf.readlines():
-        object_type, db_name, object_name, object_data = object_data_line.split("\t")
-        print(f"Processing object_type {object_type} {db_name} {object_name} ")
-        if object_type == 'database':
-            database_data = json.loads(object_data)
-            if update_table_s3_location:
-                database_data = update_database_location(database_data, table_s3_mapping)
-            create_database(glue_client, database_data)
-            database_count[db_name] += 1
-        elif object_type == 'table':
-            table_data = json.loads(object_data)
-            if update_table_s3_location:
-                table_data = update_table_location(table_data, table_s3_mapping)
-            create_table(glue_client, db_name, table_data)
-            table_count[db_name] += 1
-        elif object_type == 'partition':
-            partition_data = json.loads(object_data)
-            create_or_update_partition(glue_client, db_name, object_name, partition_data, update_table_s3_location, table_s3_mapping)
-            partition_count[db_name] += 1
+    with ThreadPoolExecutor() as tpe:
+        for object_data_line in rf.readlines():
+            object_type, db_name, object_name, object_data = object_data_line.split("\t")
+   
+            if object_type == 'database':
+                database_count[db_name] += 1
+            elif object_type == 'table':
+                table_count[db_name] += 1
+            elif object_type == 'partition':
+                partition_count[db_name] += 1
+            tpe.submit(tpetask, object_data_line,update_table_s3_location,table_s3_mapping,glue_client,database_count,table_count,partition_count)
+            #tpetask(object_data_line,update_table_s3_location,table_s3_mapping,glue_client)
     rf.close()
     for db_name in database_count.keys():
         print(f"{db_name}=>table_count:{table_count[db_name]} partition_count:{partition_count[db_name]}")
@@ -207,7 +225,7 @@ def get_tables(source_region, data_source, db_list):
     return df
 
 def extract_database(source_region, output_file_name, db_list):
-    print ("Extracting database...")
+    print("Extracting database...")
     table_count = Counter()
     database_count = Counter()
     partition_count = Counter()
@@ -215,39 +233,40 @@ def extract_database(source_region, output_file_name, db_list):
     table_paginator = glue_client.get_paginator("get_tables")
     partition_paginator = glue_client.get_paginator("get_partitions")
     db_paginator = glue_client.get_paginator("get_databases")
-    database_data_file = tempfile.NamedTemporaryFile(mode='w+b', delete=False)
-    for page in db_paginator.paginate():
-        for db in page['DatabaseList']:
-            if (db_list == ['ALL_DATABASE'] or (db['Name'] in db_list)):
-                print (f"Database {db['Name']} matched with list of databases to be extracted")
-                col_to_be_removed = ['CreateTime', 'CatalogId','VersionId']
-                _db = [db.pop(key, '') for key in col_to_be_removed]
-                database_data_file.write(f"database\t{db['Name']}\t\t{json.dumps(db)}\n".encode('utf-8'))
-                database_count[db['Name']] += 1
-                for page in table_paginator.paginate(DatabaseName=db['Name']):
-                    for table in page['TableList']:
-                        print(f"Processing table {table['Name']}")
-                        col_to_be_removed = ['CatalogId','DatabaseName','LastAccessTime','CreateTime', 'UpdateTime', 'CreatedBy','IsRegisteredWithLakeFormation','VersionId']
-                        _table = [table.pop(key,'') for key in col_to_be_removed]
-                        database_data_file.write(f"table\t{db['Name']}\t{table['Name']}\t{json.dumps(table)}\n".encode('utf-8'))
-                        table_count[db['Name']] += 1
-                        for partition_page in partition_paginator.paginate(DatabaseName=db['Name'], TableName=table['Name']):
-                            for partition in partition_page['Partitions']:
-                                print(f"Processing partition {partition['Values']} for table {table['Name']}")
-                                col_to_be_removed = ['CatalogId', 'DatabaseName', 'CreationTime', 'LastAccessTime']
-                                _partition = [partition.pop(key,'') for key in col_to_be_removed]
-                                database_data_file.write(f"partition\t{db['Name']}\t{table['Name']}\t{json.dumps(partition)}\n".encode('utf-8'))
-                                partition_count[db['Name']] += 1
-                                for db_name in table_count.keys():
-                                    print(f"{db_name}=>table_count:{table_count[db_name]}")
-                                    print (f"database_data_file.name => {database_data_file}")
-                                    print(f"Extracted database count => {len(list(database_count.keys()))}  total table count => {len(list(table_count.elements()))}")
-        # Once all databases are processed, upload the consolidated data to S3
-        database_data_file.close()
-        with open(database_data_file.name, 'rb') as file_for_upload:
-            wr.s3.upload(local_file=file_for_upload, path=output_file_name)
-            print(f"Stored consolidated data in {database_data_file}")
-        os.remove(database_data_file.name)
+
+    # Create a persistent temporary file
+    with tempfile.NamedTemporaryFile(mode='w+', delete=False) as database_data_file:
+        for page in db_paginator.paginate():
+            for db in page['DatabaseList']:
+                if db_list == ['ALL_DATABASE'] or db['Name'] in db_list:
+                    print(f"Database {db['Name']} matched with list of databases to be extracted")
+                    col_to_be_removed = ['CreateTime', 'CatalogId', 'VersionId']
+                    _ = [db.pop(key, None) for key in col_to_be_removed]
+                    database_data_file.write(f"database\t{db['Name']}\t\t{json.dumps(db)}\n")
+                    database_count[db['Name']] += 1
+                    for table_page in table_paginator.paginate(DatabaseName=db['Name']):
+                        for table in table_page['TableList']:
+                            print(f"Processing table {table['Name']}")
+                            col_to_be_removed = ['CatalogId','DatabaseName','LastAccessTime','CreateTime', 'UpdateTime', 'CreatedBy','IsRegisteredWithLakeFormation','VersionId']
+                            _ = [table.pop(key, None) for key in col_to_be_removed]
+                            database_data_file.write(f"table\t{db['Name']}\t{table['Name']}\t{json.dumps(table)}\n")
+                            table_count[db['Name']] += 1
+                            for partition_page in partition_paginator.paginate(DatabaseName=db['Name'], TableName=table['Name']):
+                                for partition in partition_page['Partitions']:
+                                    print(f"Processing partition {partition['Values']} for table {table['Name']}")
+                                    col_to_be_removed = ['CatalogId', 'DatabaseName', 'CreationTime', 'LastAccessTime']
+                                    _ = [partition.pop(key, None) for key in col_to_be_removed]
+                                    database_data_file.write(f"partition\t{db['Name']}\t{table['Name']}\t{json.dumps(partition)}\n")
+                                    partition_count[db['Name']] += 1
+        database_data_file_name = database_data_file.name
+        database_data_file.flush()
+
+    print(f"Ready to write file {database_data_file_name} to S3 {output_file_name}")
+    with open(database_data_file_name, 'rb') as file_for_upload:
+        wr.s3.upload(local_file=file_for_upload, path=output_file_name)
+        print(f"Stored consolidated data in {output_file_name}")
+
+    os.remove(database_data_file_name)
 
 def compare_db_tables(config, data_source):
     source_region = config[data_source]['source_region']
@@ -298,10 +317,12 @@ def main():
     global destination_session
     start_time = time.time()
 
-    args = getResolvedOptions(sys.argv, ['CONFIG_BUCKET','CONFIG_FILE_KEY'])
+    #args = getResolvedOptions(sys.argv, ['CONFIG_BUCKET','CONFIG_FILE_KEY'])
 
-    config_file_bucket = args['CONFIG_BUCKET']
-    config_file_key = args['CONFIG_FILE_KEY']
+    #config_file_bucket = args['CONFIG_BUCKET']
+    #config_file_key = args['CONFIG_FILE_KEY']
+    config_file_bucket = 'vp1ctldl'
+    config_file_key = 'glue_config.conf'
 
     ## if there is / in the key name, this will remove it.
     config_file_key = config_file_key.lstrip("/") if config_file_key.startswith("/") else config_file_key
