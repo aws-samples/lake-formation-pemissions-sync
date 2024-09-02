@@ -135,6 +135,11 @@ def update_table_location(table_data, table_s3_mapping):
     storage_descriptor = table_data.get('StorageDescriptor', {})
     if 'Location' in storage_descriptor:
         table_data['StorageDescriptor']['Location'] = update_location(storage_descriptor.get('Location'), table_s3_mapping)
+    
+    parameters = table_data.get('Parameters', {})
+    if 'metadata_location' in parameters:
+        parameters['metadata_location'] = update_location(parameters['metadata_location'], table_s3_mapping)
+    
     return table_data
 
 def create_or_update_partition(glue_client, db_name, table_name, partition_data, update_table_s3_location, table_s3_mapping):
@@ -317,13 +322,11 @@ def main():
     global destination_session
     start_time = time.time()
 
-    #args = getResolvedOptions(sys.argv, ['CONFIG_BUCKET','CONFIG_FILE_KEY'])
+    args = getResolvedOptions(sys.argv, ['CONFIG_BUCKET','CONFIG_FILE_KEY'])
 
-    #config_file_bucket = args['CONFIG_BUCKET']
-    #config_file_key = args['CONFIG_FILE_KEY']
-    config_file_bucket = 'vp1ctldl'
-    config_file_key = 'glue_config.conf'
-
+    config_file_bucket = args['CONFIG_BUCKET']
+    config_file_key = args['CONFIG_FILE_KEY']
+  
     ## if there is / in the key name, this will remove it.
     config_file_key = config_file_key.lstrip("/") if config_file_key.startswith("/") else config_file_key
     print (f"Reading config file from s3://{config_file_bucket}/{config_file_key}")
